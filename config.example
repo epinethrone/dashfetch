@@ -1,0 +1,17 @@
+# dashfetch config (example)
+# ALIGN: "labels" (default) or "values"
+# ALIGN="values"
+
+# Spacing between logo and text
+# GAP=4
+
+# Hide the Services line (0 = show, 1 = hide)
+# HIDE_SERVICES=0
+
+# Disable colors or logo
+# NO_COLOR=0
+# NO_LOGO=0
+
+# Reorder/prune fields:
+# Available: OS, Host, Kernel, Uptime, Shell, CPU, Memory, Disk (/), Local IP
+# FACT_ORDER=( "Host" "OS" "Kernel" "Uptime" "CPU" "Memory" "Disk (/)" "Local IP" )

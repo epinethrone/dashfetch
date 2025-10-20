@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+trap 'echo "[dashfetch] Error on line $LINENO: $BASH_COMMAND" >&2' ERR
+
+# ------------------ defaults (overridable by config/CLI) ------------------
+ALIGN="labels"      # labels | values
+NO_LOGO=0
+NO_COLOR=0
+GAP=3               # spacing between logo and first column
+HIDE_SERVICES=0     # 1 = hide services line
+
+# Default order (config can override FACT_ORDER)
+FACT_ORDER=( "OS" "Host" "Kernel" "Uptime" "Shell" "CPU" "Memory" "Disk (/)" "Local IP" )
+
+# ------------------ tiny arg parser ------------------
+parse_args() {
+  for arg in "$@"; do
+    case "$arg" in
+      --no-logo)         NO_LOGO=1 ;;
+      --no-color)        NO_COLOR=1 ;;
+      --align=labels)    ALIGN="labels" ;;
+      --align=values)    ALIGN="values" ;;
+      --gap=*)           GAP="${arg#*=}" ;;
+      --hide-services)   HIDE_SERVICES=1 ;;
+      -h|--help)
+        cat <<HLP
+dashfetch-dev [options]
+
+Options:
+  --align=labels|values   Align labels (default) or values
+  --no-logo               Hide Raspberry logo
+  --no-color              Disable colors
+  --gap=N                 Space between logo and text (default: 3)
+  --hide-services         Don’t show Services line
+  -h, --help              Show this help and exit
+HLP
+        exit 0 ;;
+      *)
+        if [[ "$arg" == -* ]]; then
+          echo "[dashfetch] Error: Unknown option '$arg'" >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done
+}
+
+# ------------------ config file (~/.config/dashfetch/config) ------------------
+load_config() {
+  local cfg="$HOME/.config/dashfetch/config"
+  if [[ -f "$cfg" ]]; then
+    # shellcheck source=/dev/null
+    source "$cfg"
+  fi
+}
+
+# ------------------ term/printing helpers ------------------
+goto_col() { tput hpa "$1" 2>/dev/null || printf '\033[%dG' "$1"; }
+
+setup_colors() {
+  if (( NO_COLOR )); then
+    B=""; R=""; G=""; N=""
+  else
+    B="$(tput bold 2>/dev/null || true)"
+    R="$(tput setaf 1 2>/dev/null || true)"
+    G="$(tput setaf 2 2>/dev/null || true)"
+    N="$(tput sgr0 2>/dev/null || true)"
+  fi
+}
+
+# ------------------ logo ------------------
+ascii_logo_plain() {
+  cat <<'EOF'
+   .~~.   .~~.
+  '. \ ' ' / .'
+   .~ .~~~..~.
+  : .~.'~'.~. :
+ ~ (   ) (   ) ~
+( : '~'.~.'~' : )
+ ~ .~ (   ) ~. ~
+  (  : '~' :  )
+   '~ .~~~. ~'
+       '~'
+EOF
+}
+
+ascii_logo() {
+  cat <<EOF
+${G}   .~~.   .~~.${N}
+${G}  '. \ ' ' / .'${N}
+${R}   .~ .~~~..~.${N}
+${R}  : .~.'~'.~. :${N}
+${R} ~ (   ) (   ) ~${N}
+${R}( : '~'.~.'~' : )${N}
+${R} ~ .~ (   ) ~. ~${N}
+${R}  (  : '~' :  )${N}
+${R}   '~ .~~~. ~'${N}
+${R}       '~'${N}
+EOF
+}
+
+# ------------------ probes ------------------
+get_os()    { . /etc/os-release; printf '%s\n' "${PRETTY_NAME:-Linux}"; }
+get_host()  { tr -d '\0' </proc/device-tree/model 2>/dev/null || hostname; }
+get_kernel(){ uname -r; }
+get_uptime(){
+  uptime -p 2>/dev/null | sed 's/^up //' \
+  || uptime | sed -E 's/^.*up ([^,]+),.*$/\1/'
+}
+get_shell(){
+  local name="${SHELL##*/}" ver=""
+  case "$name" in
+    bash) ver="${BASH_VERSION%%[^0-9.]*}" ;;
+    zsh)  ver="${ZSH_VERSION:-}" ;;
+    *)    ver="$("$SHELL" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -n1)" ;;
+  esac
+  echo "$name ${ver:-}"
+}
+get_cpu(){
+  local out
+  out="$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+  if [[ -n "${out:-}" ]]; then echo "$out"; return; fi
+  out="$(lscpu 2>/dev/null | awk -F': +' '/Model name/ {print $2; exit}' || true)"
+  if [[ -n "${out:-}" ]]; then echo "$out"; return; fi
+  local chip
+  chip="$(tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null | grep -m1 'bcm[0-9]\+' || true)"
+  case "$chip" in
+    *bcm2712*) echo "Broadcom BCM2712 (Cortex-A76 x4)";;
+    *bcm2711*) echo "Broadcom BCM2711 (Cortex-A72 x4)";;
+    *)         echo "Broadcom SoC";;
+  esac
+}
+get_mem(){
+  read -r u t < <(free -m | awk 'NR==2 {print $3, $2}')
+  printf '%sMiB / %sMiB\n' "$u" "$t"
+}
+get_disk(){
+  read -r u t p < <(df -m / | awk 'NR==2 {print $3, $2, $5}')
+  printf '%sMiB / %sMiB (%s)\n' "$u" "$t" "$p"
+}
+get_ip(){
+  local iface ip
+  iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); break}}')"
+  ip="$(ip -4 -o addr show dev "${iface:-eth0}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+  [[ -z "${ip:-}" ]] && ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  echo "$ip"
+}
+get_services(){
+  if [[ -x "$HOME/.local/bin/ff-services.sh" ]]; then
+    "$HOME/.local/bin/ff-services.sh" 2>/dev/null || true
+  else
+    echo ""
+  fi
+}
+
+# ------------------ fact registry (no eval) ------------------
+declare -A FACT_FUNCS=(
+  ["OS"]="get_os"
+  ["Host"]="get_host"
+  ["Kernel"]="get_kernel"
+  ["Uptime"]="get_uptime"
+  ["Shell"]="get_shell"
+  ["CPU"]="get_cpu"
+  ["Memory"]="get_mem"
+  ["Disk (/)"]="get_disk"
+  ["Local IP"]="get_ip"
+)
+
+# --- Info collection helper ---
+INFO=()
+MAX_LABEL_WIDTH=0
+add() {
+  local label="$1" value="$2" len
+  INFO+=("${label}|${value}")
+  len=${#label}
+  if (( len > MAX_LABEL_WIDTH )); then MAX_LABEL_WIDTH=$len; fi
+}
+
+# ------------------ main ------------------
+main() {
+  load_config
+  parse_args "$@"
+  setup_colors
+
+  # Collect facts based on FACT_ORDER (warn on invalid)
+  local label func value
+  for label in "${FACT_ORDER[@]}"; do
+    func="${FACT_FUNCS[$label]:-}"
+    if [[ -n "$func" ]] && type -t "$func" >/dev/null; then
+      value="$("$func")"
+      add "$label" "$value"
+    else
+      echo "[dashfetch] Warning: Invalid fact '$label' in FACT_ORDER. Skipping." >&2
+    fi
+  done
+
+  # Optional services line
+  if (( ! HIDE_SERVICES )); then
+    local svc; svc="$(get_services)"
+    [[ -n "$svc" ]] && add "Services" "$svc"
+  fi
+
+  # Logo + measurement
+  local LOGO_W=0
+  local -a LOGO_LINES=()
+  if (( ! NO_LOGO )); then
+    readarray -t LOGO_LINES < <(ascii_logo)
+    local -a LOGO_PLAIN
+    readarray -t LOGO_PLAIN < <(ascii_logo_plain)
+    for line in "${LOGO_PLAIN[@]}"; do
+      (( ${#line} > LOGO_W )) && LOGO_W=${#line}
+    done
+  fi
+
+  # Columns
+  local LABEL_COL VAL_COL
+  LABEL_COL=$(( LOGO_W + GAP ))
+  VAL_COL=$(( LABEL_COL + MAX_LABEL_WIDTH + 2 ))
+
+  # Row count
+  local rows
+  rows=$(( ${#LOGO_LINES[@]} > ${#INFO[@]} ? ${#LOGO_LINES[@]} : ${#INFO[@]} ))
+
+  # Render
+  for ((i=0; i<rows; i++)); do
+    # Logo
+    if (( ! NO_LOGO )) && [[ $i -lt ${#LOGO_LINES[@]} ]]; then
+      printf "%s" "${LOGO_LINES[i]}"
+    fi
+
+    # Right column
+    if [[ $i -lt ${#INFO[@]} ]]; then
+      IFS='|' read -r label value <<< "${INFO[i]}"
+      case "$ALIGN" in
+        values)
+          goto_col "$LABEL_COL"; printf "%s%s%s%s" "$B" "$R" "$label" "$N"
+          goto_col "$VAL_COL";   printf "%s" "$value"
+          ;;
+        *)
+          goto_col "$LABEL_COL"
+          printf "%s%s%-*s%s  %s" "$B" "$R" "$MAX_LABEL_WIDTH" "$label" "$N" "$value"
+          ;;
+      esac
+    fi
+    echo
+  done
+}
+
+main "$@"
